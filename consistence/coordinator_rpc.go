@@ -43,20 +43,36 @@ const (
 	RpcErrWriteOnNonISR
 )
 
-type SlaveAsyncWriteResult struct {
-	ret gorpc.AsyncResult
+type SlaveWriteResult struct {
+	Ret *gorpc.AsyncResult
+	SyncCoordErr *CoordErr
 }
 
-func (self *SlaveAsyncWriteResult) Wait() {
-	<-self.ret.Done
+func (self *SlaveWriteResult) wait(ticker *time.Ticker) *CoordErr {
+	select {
+	case <-ticker.C:
+		coordLog.Infof("sync operation timeout")
+		return ErrClusterSyncTimeout
+	case <-self.Ret.Done:
+		return nil
+	}
 }
 
-func (self *SlaveAsyncWriteResult) GetResult() *CoordErr {
-	coordErr, ok := self.ret.Response.(*CoordErr)
-	if ok {
-		return convertRpcError(self.ret.Error, coordErr)
+func (self *SlaveWriteResult) GetResult(ticker *time.Ticker) *CoordErr {
+	if self.Ret != nil {
+		var coordErr *CoordErr
+		if coordErr = self.wait(ticker); coordErr != nil {
+			return convertRpcError(nil, coordErr)
+		}
+
+		coordErr, ok := self.Ret.Response.(*CoordErr)
+		if ok {
+			return convertRpcError(self.Ret.Error, coordErr)
+		} else {
+			return convertRpcError(self.Ret.Error, nil)
+		}
 	} else {
-		return convertRpcError(self.ret.Error, nil)
+		return convertRpcError(nil, self.SyncCoordErr)
 	}
 }
 

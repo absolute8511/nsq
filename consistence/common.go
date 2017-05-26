@@ -185,6 +185,7 @@ var (
 	ErrLocalInitTopicFailed                = NewCoordErr("local topic init failed", CoordLocalErr)
 	ErrLocalInitTopicCoordFailed           = NewCoordErr("topic coordinator init failed", CoordLocalErr)
 	ErrLocalTopicDataCorrupt               = NewCoordErr("local topic data corrupt", CoordLocalErr)
+	ErrClusterSyncTimeout               = NewCoordErr("cluster sync timeout ", CoordNetErr)
 )
 
 func GenNsqdNodeID(n *NsqdNodeInfo, extra string) string {

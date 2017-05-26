@@ -13,8 +13,9 @@ type localExitFunc func(*CoordErr)
 type localCommitFunc func() error
 type localRollbackFunc func()
 type refreshCoordFunc func(*coordData) *CoordErr
-type slaveSyncFunc func(*NsqdRpcClient, string, *coordData) *CoordErr
-type slaveAsyncFunc func(*NsqdRpcClient, string, *coordData) *SlaveAsyncWriteResult
+//return SlaveAsyncWriteResult and CoordErr, if rpc call in sync function is async rpc,future result returns in
+// *SlaveAsyncWriteResult, else *SlaveAsyncWriteResult should always == nil
+type slaveSyncFunc func(*NsqdRpcClient, string, *coordData) *SlaveWriteResult
 
 type handleSyncResultFunc func(int, *coordData) bool
 
@@ -94,14 +95,9 @@ func (self *NsqdCoordinator) PutMessageToCluster(topic *nsqd.Topic,
 		self.requestNotifyNewTopicInfo(d.topicInfo.Name, d.topicInfo.Partition)
 		return nil
 	}
-	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
+	doSlaveAsync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) (*SlaveWriteResult) {
 		// should retry if failed, and the slave should keep the last success write to avoid the duplicated
-		putErr := c.PutMessage(&tcData.topicLeaderSession, &tcData.topicInfo, commitLog, msg)
-		if putErr != nil {
-			coordLog.Infof("sync write to replica %v failed: %v. put offset:%v, logmgr: %v, %v",
-				nodeID, putErr, commitLog, logMgr.pLogID, logMgr.nLogID)
-		}
-		return putErr
+		return  c.PutMessageAsync(&tcData.topicLeaderSession, &tcData.topicInfo, commitLog, msg)
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		if successNum == len(tcData.topicInfo.ISR) {
@@ -117,7 +113,7 @@ func (self *NsqdCoordinator) PutMessageToCluster(topic *nsqd.Topic,
 	}
 
 	clusterErr := self.doSyncOpToCluster(true, coord, doLocalWrite, doLocalExit, doLocalCommit, doLocalRollback,
-		doRefresh, doSlaveSync, handleSyncResult)
+		doRefresh, doSlaveAsync, handleSyncResult)
 
 	var err error
 	if clusterErr != nil {
@@ -201,14 +197,9 @@ func (self *NsqdCoordinator) PutMessagesToCluster(topic *nsqd.Topic,
 		self.requestNotifyNewTopicInfo(d.topicInfo.Name, d.topicInfo.Partition)
 		return nil
 	}
-	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
+	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *SlaveWriteResult {
 		// should retry if failed, and the slave should keep the last success write to avoid the duplicated
-		putErr := c.PutMessages(&tcData.topicLeaderSession, &tcData.topicInfo, commitLog, msgs)
-		if putErr != nil {
-			coordLog.Infof("sync write to replica %v failed: %v, put offset: %v, logmgr: %v, %v",
-				nodeID, putErr, commitLog, logMgr.pLogID, logMgr.nLogID)
-		}
-		return putErr
+		return c.PutMessagesAsync(&tcData.topicLeaderSession, &tcData.topicInfo, commitLog, msgs)
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		if successNum == len(tcData.topicInfo.ISR) {
@@ -225,6 +216,7 @@ func (self *NsqdCoordinator) PutMessagesToCluster(topic *nsqd.Topic,
 	clusterErr := self.doSyncOpToCluster(true, coord, doLocalWrite, doLocalExit, doLocalCommit, doLocalRollback,
 		doRefresh, doSlaveSync, handleSyncResult)
 
+
 	var err error
 	if clusterErr != nil {
 		err = clusterErr.ToErrorType()
@@ -237,8 +229,8 @@ func (self *NsqdCoordinator) PutMessagesToCluster(topic *nsqd.Topic,
 }
 
 func (self *NsqdCoordinator) doSyncOpToCluster(isWrite bool, coord *TopicCoordinator, doLocalWrite localWriteFunc,
-	doLocalExit localExitFunc, doLocalCommit localCommitFunc, doLocalRollback localRollbackFunc,
-	doRefresh refreshCoordFunc, doSlaveSync slaveSyncFunc, handleSyncResult handleSyncResultFunc) *CoordErr {
+doLocalExit localExitFunc, doLocalCommit localCommitFunc, doLocalRollback localRollbackFunc,
+doRefresh refreshCoordFunc, doSlaveSync slaveSyncFunc, handleSyncResult handleSyncResultFunc) *CoordErr {
 
 	if isWrite {
 		coord.writeHold.Lock()
@@ -279,6 +271,16 @@ func (self *NsqdCoordinator) doSyncOpToCluster(isWrite bool, coord *TopicCoordin
 	failedNodes := make(map[string]struct{})
 	retryCnt := uint32(0)
 	exitErr := 0
+	//totalTimeout = syncTimeout * #replica
+	totalTimeout := time.Millisecond * 1
+	//replica synchronization timeout per replica
+	syncTimeout := time.Second * 3
+	var timeoutTick *time.Ticker
+	type RpcResp struct {
+		nodeId string
+		ret *SlaveWriteResult
+	}
+	var rpcResps []RpcResp
 
 	localErr := doLocalWrite(tcData)
 	if localErr != nil {
@@ -287,7 +289,7 @@ func (self *NsqdCoordinator) doSyncOpToCluster(isWrite bool, coord *TopicCoordin
 	}
 	needLeaveISR = true
 
-retrysync:
+	retrysync:
 	if retryCnt > MAX_WRITE_RETRY {
 		coordLog.Warningf("retrying times is large: %v", retryCnt)
 		needRefreshISR = true
@@ -318,15 +320,12 @@ retrysync:
 		}
 	}
 	success = 0
-	failedNodes = make(map[string]struct{})
 	retryCnt++
-
 	// send message to slaves with current topic epoch
 	// replica should check if offset matching. If not matched the replica should leave the ISR list.
 	// also, the coordinator should retry on fail until all nodes in ISR success.
 	// If failed, should update ISR and retry.
 	// write epoch should keep the same (ignore epoch change during write)
-	// TODO: optimize send all requests first and then wait all responses
 	exitErr = 0
 	for _, nodeID := range tcData.topicInfo.ISR {
 		if nodeID == self.myNode.GetID() {
@@ -341,12 +340,15 @@ retrysync:
 			failedNodes[nodeID] = struct{}{}
 			continue
 		}
+
 		var start time.Time
 		if checkCost {
 			start = time.Now()
 		}
 		// should retry if failed, and the slave should keep the last success write to avoid the duplicated
-		rpcErr = doSlaveSync(c, nodeID, tcData)
+		retSlave := doSlaveSync(c, nodeID, tcData)
+		rpcResps = append(rpcResps, RpcResp{nodeID, retSlave})
+		totalTimeout = totalTimeout + syncTimeout
 		if checkCost {
 			cost := time.Since(start)
 			if cost > time.Millisecond*3 {
@@ -356,6 +358,14 @@ retrysync:
 				coordLog.Warningf("slave(%v) sync cost: %v, start: %v, end: %v", nodeID, cost, start, time.Now())
 			}
 		}
+	}
+	timeoutTick = time.NewTicker(totalTimeout)
+	for _, rpcResp := range rpcResps {
+		nodeID := rpcResp.nodeId
+		retSlave := rpcResp.ret
+
+		rpcErr := retSlave.GetResult(timeoutTick)
+
 		if rpcErr == nil {
 			success++
 		} else {
@@ -365,7 +375,7 @@ retrysync:
 			if !rpcErr.CanRetryWrite(int(retryCnt)) {
 				exitErr++
 				coordLog.Infof("operation failed and no retry type: %v, %v", rpcErr.ErrType, exitErr)
-				if exitErr > len(tcData.topicInfo.ISR)/2 {
+				if int(exitErr) > len(tcData.topicInfo.ISR)/2 {
 					needLeaveISR = true
 					goto exitsync
 				}
@@ -373,7 +383,7 @@ retrysync:
 		}
 	}
 
-	if handleSyncResult(success, tcData) {
+	if handleSyncResult(int(success), tcData) {
 		localErr := doLocalCommit()
 		if localErr != nil {
 			coordLog.Errorf("topic : %v failed commit operation: %v", topicFullName, localErr)
@@ -385,7 +395,7 @@ retrysync:
 		}
 	} else {
 		coordLog.Warningf("topic %v sync operation failed since no enough success: %v", topicFullName, success)
-		if success > tcData.topicInfo.Replica/2 {
+		if int(success) > tcData.topicInfo.Replica/2 {
 			needLeaveISR = false
 			if retryCnt > MAX_WRITE_RETRY {
 				// request lookup to remove the failed nodes from isr and keep the quorum alive.
@@ -738,16 +748,16 @@ func (self *NsqdCoordinator) SetChannelConsumeOffsetToCluster(ch *nsqd.Channel, 
 	doRefresh := func(d *coordData) *CoordErr {
 		return nil
 	}
-	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
+	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) (*SlaveWriteResult) {
 		if ch.IsEphemeral() {
-			return nil
+			return &SlaveWriteResult{nil, nil}
 		}
 		rpcErr := c.UpdateChannelOffset(&tcData.topicLeaderSession, &tcData.topicInfo, ch.GetName(), syncOffset)
 		if rpcErr != nil {
 			coordLog.Infof("sync channel(%v) offset to replica %v failed: %v, offset: %v", ch.GetName(),
 				nodeID, rpcErr, syncOffset)
 		}
-		return rpcErr
+		return &SlaveWriteResult{nil, rpcErr}
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		if successNum == len(tcData.topicInfo.ISR) {
@@ -812,9 +822,9 @@ func (self *NsqdCoordinator) FinishMessageToCluster(channel *nsqd.Channel, clien
 	doRefresh := func(d *coordData) *CoordErr {
 		return nil
 	}
-	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
+	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *SlaveWriteResult {
 		if !changed || channel.IsEphemeral() {
-			return nil
+			return &SlaveWriteResult{nil, nil}
 		}
 		var rpcErr *CoordErr
 		if channel.IsOrdered() {
@@ -827,7 +837,7 @@ func (self *NsqdCoordinator) FinishMessageToCluster(channel *nsqd.Channel, clien
 			coordLog.Infof("sync channel(%v) offset to replica %v failed: %v, offset: %v", channel.GetName(),
 				nodeID, rpcErr, syncOffset)
 		}
-		return rpcErr
+		return &SlaveWriteResult{nil, rpcErr}
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		// we can ignore the error if this channel is not ordered. (just sync next time)
@@ -940,13 +950,13 @@ func (self *NsqdCoordinator) DeleteChannel(topic *nsqd.Topic, channelName string
 	doRefresh := func(d *coordData) *CoordErr {
 		return nil
 	}
-	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
+	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *SlaveWriteResult {
 		rpcErr := c.DeleteChannel(&tcData.topicLeaderSession, &tcData.topicInfo, channelName)
 		if rpcErr != nil {
 			coordLog.Infof("delete channel(%v) to replica %v failed: %v", channelName,
 				nodeID, rpcErr)
 		}
-		return rpcErr
+		return &SlaveWriteResult{nil, rpcErr}
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		// we can ignore the error if this channel is not ordered. (just sync next time)

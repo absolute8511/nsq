@@ -27,6 +27,10 @@ type NsqdRpcClient struct {
 	grpcConn   *grpc.ClientConn
 }
 
+func ConvertRpcError(err error, errInterface interface{}) *CoordErr {
+	return convertRpcError(err, errInterface)
+}
+
 func convertRpcError(err error, errInterface interface{}) *CoordErr {
 	if err != nil {
 		return NewCoordErr(err.Error(), CoordNetErr)
@@ -143,6 +147,31 @@ func (self *NsqdRpcClient) Reconnect() error {
 func (self *NsqdRpcClient) CallFast(method string, arg interface{}) (interface{}, error) {
 	reply, err := self.dc.CallTimeout(method, arg, time.Second)
 	return reply, err
+}
+
+func (self *NsqdRpcClient) CallWithRetryAsync(method string, arg interface{}) (*gorpc.AsyncResult, error) {
+	retry := 0
+	var err error
+	var reply *gorpc.AsyncResult
+	for retry < 5 {
+		retry++
+		reply, err = self.dc.CallAsync(method, arg)
+		if err != nil {
+			cerr, ok := err.(*gorpc.ClientError)
+			if (ok && cerr.Connection) || self.ShouldRemoved() {
+				coordLog.Infof("rpc connection closed, error: %v", err)
+				connErr := self.Reconnect()
+				if connErr != nil {
+					return reply, err
+				}
+			} else {
+				return reply, err
+			}
+		} else {
+			return reply, err
+		}
+	}
+	return nil, err
 }
 
 func (self *NsqdRpcClient) CallWithRetry(method string, arg interface{}) (interface{}, error) {
@@ -342,7 +371,7 @@ func (self *NsqdRpcClient) UpdateChannelOffset(leaderSession *TopicLeaderSession
 	return convertRpcError(err, retErr)
 }
 
-func (self *NsqdRpcClient) PutMessage(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, message *nsqd.Message) *CoordErr {
+func (self *NsqdRpcClient) PutMessage(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, message *nsqd.Message) *SlaveWriteResult {
 	// it seems grpc is slower, so disable it.
 	if self.grpcClient != nil && false {
 		ctx, cancel := context.WithTimeout(context.Background(), RPC_TIMEOUT_SHORT)
@@ -376,7 +405,7 @@ func (self *NsqdRpcClient) PutMessage(leaderSession *TopicLeaderSession, info *T
 		retErr, err := self.grpcClient.PutMessage(ctx, &req)
 		cancel()
 		if err == nil {
-			return convertRpcError(err, retErr)
+			return &SlaveWriteResult{nil, convertRpcError(err, retErr)}
 		}
 		// maybe old server not implemented the grpc method.
 	}
@@ -390,10 +419,44 @@ func (self *NsqdRpcClient) PutMessage(leaderSession *TopicLeaderSession, info *T
 	putData.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
 	putData.TopicLeaderSession = leaderSession.Session
 	retErr, err := self.CallWithRetry("PutMessage", &putData)
-	return convertRpcError(err, retErr)
+	return &SlaveWriteResult{ SyncCoordErr:convertRpcError(err, retErr)}
 }
 
-func (self *NsqdRpcClient) PutMessages(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, messages []*nsqd.Message) *CoordErr {
+func (self *NsqdRpcClient) PutMessageAsync(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, message *nsqd.Message) *SlaveWriteResult {
+	var putData RpcPutMessage
+	putData.LogData = log
+	putData.TopicName = info.Name
+	putData.TopicPartition = info.Partition
+	putData.TopicMessage = message
+	putData.TopicWriteEpoch = info.EpochForWrite
+	putData.Epoch = info.Epoch
+	putData.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
+	putData.TopicLeaderSession = leaderSession.Session
+	asyncResult, err := self.CallWithRetryAsync("PutMessage", &putData)
+	if err != nil {
+		return &SlaveWriteResult{nil, NewCoordErr(err.Error(), CoordNetErr)}
+	}
+	return &SlaveWriteResult{asyncResult, nil}
+}
+
+func (self *NsqdRpcClient) PutMessagesAsync(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, messages []*nsqd.Message) *SlaveWriteResult {
+	var putData RpcPutMessages
+	putData.LogData = log
+	putData.TopicName = info.Name
+	putData.TopicPartition = info.Partition
+	putData.TopicMessages = messages
+	putData.TopicWriteEpoch = info.EpochForWrite
+	putData.Epoch = info.Epoch
+	putData.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
+	putData.TopicLeaderSession = leaderSession.Session
+	retErr, err := self.CallWithRetryAsync("PutMessages", &putData)
+	if err != nil {
+		return &SlaveWriteResult{nil, NewCoordErr(err.Error(), CoordNetErr)}
+	}
+	return &SlaveWriteResult{retErr, nil}
+}
+
+func (self *NsqdRpcClient) PutMessages(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, log CommitLogData, messages []*nsqd.Message) *SlaveWriteResult {
 	if self.grpcClient != nil && false {
 		ctx, cancel := context.WithTimeout(context.Background(), RPC_TIMEOUT_SHORT)
 		var req pb.RpcPutMessages
@@ -429,7 +492,7 @@ func (self *NsqdRpcClient) PutMessages(leaderSession *TopicLeaderSession, info *
 		retErr, err := self.grpcClient.PutMessages(ctx, &req)
 		cancel()
 		if err == nil {
-			return convertRpcError(err, retErr)
+			return &SlaveWriteResult{nil, convertRpcError(err, retErr)}
 		}
 		// maybe old server not implemented the grpc method.
 	}
@@ -444,7 +507,7 @@ func (self *NsqdRpcClient) PutMessages(leaderSession *TopicLeaderSession, info *
 	putData.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
 	putData.TopicLeaderSession = leaderSession.Session
 	retErr, err := self.CallWithRetry("PutMessages", &putData)
-	return convertRpcError(err, retErr)
+	return &SlaveWriteResult{nil, convertRpcError(err, retErr)}
 }
 
 func (self *NsqdRpcClient) GetLastCommitLogID(topicInfo *TopicPartitionMetaInfo) (int64, *CoordErr) {

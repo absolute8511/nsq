@@ -1403,6 +1403,8 @@ func benchmarkNsqdCoordPubWithArg(b *testing.B, replica int, size int) {
 
 	var nsqdCoord2 *NsqdCoordinator
 	var nsqdCoord3 *NsqdCoordinator
+	var nsqdCoord4 *NsqdCoordinator
+	var nsqdCoord5 *NsqdCoordinator
 	if replica >= 2 {
 		nsqd2, randPort2, _, data2 := newNsqdNode(nil, "id2")
 
@@ -1423,6 +1425,27 @@ func benchmarkNsqdCoordPubWithArg(b *testing.B, replica int, size int) {
 		defer nsqdCoord3.Stop()
 
 	}
+	if replica >= 4 {
+		nsqd4, randPort4, _, data4 := newNsqdNode(nil, "id4")
+		defer os.RemoveAll(data4)
+		defer nsqd4.Exit()
+		nsqdCoord4 = startNsqdCoord(nil, strconv.Itoa(randPort4), data4, "id4", nsqd4, true)
+		nsqdCoord4.enableBenchCost = true
+		nsqdCoord4.Start()
+		defer nsqdCoord4.Stop()
+
+	}
+
+	if replica >= 5 {
+		nsqd5, randPort5, _, data5 := newNsqdNode(nil, "id5")
+		defer os.RemoveAll(data5)
+		defer nsqd5.Exit()
+		nsqdCoord5 = startNsqdCoord(nil, strconv.Itoa(randPort5), data5, "id5", nsqd5, true)
+		nsqdCoord5.enableBenchCost = true
+		nsqdCoord5.Start()
+		defer nsqdCoord5.Stop()
+
+	}
 
 	topicDataList := make([]*nsqdNs.Topic, 0)
 	for tnum := 0; tnum < 20; tnum++ {
@@ -1439,6 +1462,12 @@ func benchmarkNsqdCoordPubWithArg(b *testing.B, replica int, size int) {
 		if replica >= 3 {
 			topicInitInfo.ISR = append(topicInitInfo.ISR, nsqdCoord3.myNode.GetID())
 		}
+		if replica >= 4 {
+			topicInitInfo.ISR = append(topicInitInfo.ISR, nsqdCoord4.myNode.GetID())
+		}
+		if replica >= 5 {
+			topicInitInfo.ISR = append(topicInitInfo.ISR, nsqdCoord5.myNode.GetID())
+		}
 		topicInitInfo.Leader = nsqdCoord1.myNode.GetID()
 		topicInitInfo.Replica = replica
 		ensureTopicOnNsqdCoord(nsqdCoord1, topicInitInfo)
@@ -1447,6 +1476,12 @@ func benchmarkNsqdCoordPubWithArg(b *testing.B, replica int, size int) {
 		}
 		if replica >= 3 {
 			ensureTopicOnNsqdCoord(nsqdCoord3, topicInitInfo)
+		}
+		if replica >= 4 {
+			ensureTopicOnNsqdCoord(nsqdCoord4, topicInitInfo)
+		}
+		if replica >= 5 {
+			ensureTopicOnNsqdCoord(nsqdCoord5, topicInitInfo)
 		}
 		leaderSession := &TopicLeaderSession{
 			LeaderNode:  nodeInfo1,
@@ -1463,6 +1498,14 @@ func benchmarkNsqdCoordPubWithArg(b *testing.B, replica int, size int) {
 		if replica >= 3 {
 			ensureTopicLeaderSession(nsqdCoord3, topic, partition, leaderSession)
 			ensureTopicDisableWrite(nsqdCoord3, topic, partition, false)
+		}
+		if replica >= 4 {
+			ensureTopicLeaderSession(nsqdCoord4, topic, partition, leaderSession)
+			ensureTopicDisableWrite(nsqdCoord4, topic, partition, false)
+		}
+		if replica >= 5 {
+			ensureTopicLeaderSession(nsqdCoord5, topic, partition, leaderSession)
+			ensureTopicDisableWrite(nsqdCoord5, topic, partition, false)
 		}
 		msg := make([]byte, size)
 		// check if write ok
@@ -1523,4 +1566,20 @@ func BenchmarkNsqdCoordPub2Replicator1024(b *testing.B) {
 
 func BenchmarkNsqdCoordPub3Replicator1024(b *testing.B) {
 	benchmarkNsqdCoordPubWithArg(b, 3, 1024)
+}
+
+func BenchmarkNsqdCoordPub5Replicator128(b *testing.B) {
+	benchmarkNsqdCoordPubWithArg(b, 5, 128)
+}
+
+func BenchmarkNsqdCoordPub5Replicator1024(b *testing.B) {
+	benchmarkNsqdCoordPubWithArg(b, 5, 1024)
+}
+
+func BenchmarkNsqdCoordPub4Replicator128(b *testing.B) {
+	benchmarkNsqdCoordPubWithArg(b, 4, 128)
+}
+
+func BenchmarkNsqdCoordPub4Replicator1024(b *testing.B) {
+	benchmarkNsqdCoordPubWithArg(b, 4, 1024)
 }
